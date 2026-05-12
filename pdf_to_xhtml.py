@@ -429,6 +429,10 @@ def cmd_convert(args: argparse.Namespace) -> int:
     out_parts: list[str] = []
     prev_tag: str | None = None
     prev_block: Block | None = None
+    # After a "CHAPTER N" block, the next heading is the chapter title and
+    # gets a different class (chapter-heading by convention). Carries over
+    # past non-heading blocks; cleared once consumed by a heading.
+    next_heading_class: str | None = None
     for b in filtered:
         if b.kind == "image":
             out_parts.append(_render_image(args.image_class))
@@ -449,11 +453,14 @@ def cmd_convert(args: argparse.Namespace) -> int:
             )
             prev_tag = "h2"
             prev_block = b
+            next_heading_class = args.chapter_heading_class
             continue
 
         tag, explicit_cls = size_to_tag.get(b.size, (args.default_tag, None))
         if explicit_cls is not None:
             cls = explicit_cls or None
+        elif tag in themed_tags and next_heading_class:
+            cls = next_heading_class
         elif tag in themed_tags and args.heading_class:
             cls = args.heading_class
         elif tag == "p" and args.break_class:
@@ -480,6 +487,8 @@ def cmd_convert(args: argparse.Namespace) -> int:
         out_parts.append(_render(tag, rendered_text, cls=cls))
         prev_tag = tag
         prev_block = b
+        if tag in themed_tags:
+            next_heading_class = None  # consumed by this heading
 
     xhtml = _wrap_xhtml(_assemble_body(out_parts), title=args.title or Path(args.pdf).stem)
     out_path = Path(args.out)
@@ -633,6 +642,11 @@ def main(argv: list[str] | None = None) -> int:
         "--chapter-number-class",
         default="chapter-number",
         help='class on the <h2> that wraps a detected "CHAPTER N" line (default: chapter-number)',
+    )
+    pc.add_argument(
+        "--chapter-heading-class",
+        default="chapter-heading",
+        help='class auto-applied to the first heading that follows a "CHAPTER N" block (default: chapter-heading). Overridden by an explicit --map SIZE=TAG:CLASS entry.',
     )
     pc.add_argument(
         "--small-caps-pattern",
