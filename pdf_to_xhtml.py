@@ -55,14 +55,23 @@ class Block:
         """Plain visible text (for analysis: inspect, length checks, sentence-end detection)."""
         return _render_paragraph(self.lines, dehyphenate=dehyphenate, html_mode=False)
 
-    def html(self, dehyphenate: bool = False, emit_em: bool = True, emit_strong: bool = True) -> str:
-        """HTML-escaped text with optional <em>/<strong> wrapping at formatting transitions."""
+    def html(
+        self,
+        dehyphenate: bool = False,
+        emit_em: bool = True,
+        emit_strong: bool = True,
+        small_caps_pattern: "re.Pattern[str] | None" = None,
+        small_caps_class: str = "ttl sc",
+    ) -> str:
+        """HTML-escaped text with optional <em>/<strong>/small-caps wrapping."""
         return _render_paragraph(
             self.lines,
             dehyphenate=dehyphenate,
             html_mode=True,
             emit_em=emit_em,
             emit_strong=emit_strong,
+            small_caps_pattern=small_caps_pattern,
+            small_caps_class=small_caps_class,
         )
 
 
@@ -205,6 +214,8 @@ def _render_paragraph(
     html_mode: bool = False,
     emit_em: bool = True,
     emit_strong: bool = True,
+    small_caps_pattern: "re.Pattern[str] | None" = None,
+    small_caps_class: str = "ttl sc",
 ) -> str:
     """Join a paragraph's lines into a single string.
 
@@ -256,6 +267,12 @@ def _render_paragraph(
                 continue
             if html_mode:
                 text = html.escape(text, quote=False)
+                if small_caps_pattern is not None:
+                    cls_attr = html.escape(small_caps_class, quote=True)
+                    text = small_caps_pattern.sub(
+                        lambda m: f'<span class="{cls_attr}">{m.group(0)}</span>',
+                        text,
+                    )
                 if emit_em and span.italic:
                     text = f"<em>{text}</em>"
                 if emit_strong and span.bold:
@@ -403,6 +420,8 @@ def cmd_convert(args: argparse.Namespace) -> int:
     # and emits them as <h2 class="chapter-number">CHAPTER N</h2>.
     chapter_marker = re.compile(r"^CHAPTER\s+\S+$")
 
+    small_caps_pattern = re.compile(args.small_caps_pattern) if args.small_caps_pattern else None
+
     # 4. Render. Track previous element so we can mark first-of-section <p>s.
     heading_tags = {"h1", "h2", "h3", "h4", "h5", "h6"}
     themed_tags = {"h1", "h2", "h3"}
@@ -455,6 +474,8 @@ def cmd_convert(args: argparse.Namespace) -> int:
             dehyphenate=args.dehyphenate,
             emit_em=not args.no_emphasis,
             emit_strong=not args.no_emphasis and not is_heading,
+            small_caps_pattern=small_caps_pattern if not is_heading else None,
+            small_caps_class=args.small_caps_class,
         )
         out_parts.append(_render(tag, rendered_text, cls=cls))
         prev_tag = tag
@@ -612,6 +633,22 @@ def main(argv: list[str] | None = None) -> int:
         "--chapter-number-class",
         default="chapter-number",
         help='class on the <h2> that wraps a detected "CHAPTER N" line (default: chapter-number)',
+    )
+    pc.add_argument(
+        "--small-caps-pattern",
+        default="",
+        help=(
+            "regex matching runs of text to wrap as small caps. "
+            r"OpenType smcp can't be detected from PDF metadata, so this is a heuristic. "
+            r"Try '\b[A-Z]{4,}\b' (4+ letter caps catches LOVE/REMEMBER, skips AI/EU/FSC). "
+            "Disabled by default; applies only to body, not headings. "
+            "Watch for acronyms — you'll need to unwrap any false positives."
+        ),
+    )
+    pc.add_argument(
+        "--small-caps-class",
+        default="ttl sc",
+        help="class on the wrapping <span> for small-caps matches (default: 'ttl sc')",
     )
     pc.set_defaults(func=cmd_convert)
 
