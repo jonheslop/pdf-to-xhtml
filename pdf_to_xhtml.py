@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -36,17 +37,33 @@ import fitz  # PyMuPDF
 
 
 @dataclass
+class Span:
+    text: str
+    italic: bool = False
+    bold: bool = False
+
+
+@dataclass
 class Block:
     page: int
     size: float           # dominant (most-used) font size in the block; 0 for images
     bbox: tuple[float, float, float, float]
-    lines: list[str] = field(default_factory=list)
-    bold: bool = False
-    italic: bool = False
+    lines: list[list[Span]] = field(default_factory=list)  # each line is a list of spans
     kind: str = "text"    # "text" or "image"
 
     def text(self, dehyphenate: bool = False) -> str:
-        return _join_lines(self.lines, dehyphenate=dehyphenate)
+        """Plain visible text (for analysis: inspect, length checks, sentence-end detection)."""
+        return _render_paragraph(self.lines, dehyphenate=dehyphenate, html_mode=False)
+
+    def html(self, dehyphenate: bool = False, emit_em: bool = True, emit_strong: bool = True) -> str:
+        """HTML-escaped text with optional <em>/<strong> wrapping at formatting transitions."""
+        return _render_paragraph(
+            self.lines,
+            dehyphenate=dehyphenate,
+            html_mode=True,
+            emit_em=emit_em,
+            emit_strong=emit_strong,
+        )
 
 
 def _flags_bold(flags: int) -> bool:
@@ -85,6 +102,26 @@ def read_blocks(
     return blocks
 
 
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _build_spans(raw_spans: list[dict]) -> list[Span]:
+    """Build a list of Span objects from PyMuPDF's raw spans, collapsing
+    whitespace within each span. Leading/trailing whitespace at the line
+    edges is stripped by the caller."""
+    out: list[Span] = []
+    for s in raw_spans:
+        text = _WHITESPACE_RUN.sub(" ", s["text"])
+        if not text:
+            continue
+        flags = s.get("flags", 0)
+        font = s.get("font", "")
+        italic = _flags_italic(flags) or any(tag in font for tag in ("Italic", "Oblique"))
+        bold = _flags_bold(flags) or any(tag in font for tag in ("Bold", "Black", "Heavy"))
+        out.append(Span(text=text, italic=italic, bold=bold))
+    return out
+
+
 def _split_block(block: dict, page_index: int, indent_threshold: float) -> list[Block]:
     """Convert one PyMuPDF block into one or more Blocks.
 
@@ -95,29 +132,23 @@ def _split_block(block: dict, page_index: int, indent_threshold: float) -> list[
     """
     line_records = []
     for line in block["lines"]:
-        spans = line["spans"]
+        raw_spans = line["spans"]
+        if not raw_spans:
+            continue
+        spans = _build_spans(raw_spans)
         if not spans:
             continue
-        text = "".join(s["text"] for s in spans).strip()
-        if not text:
+        # Strip leading whitespace from first span, trailing from last span.
+        spans[0].text = spans[0].text.lstrip()
+        spans[-1].text = spans[-1].text.rstrip()
+        spans = [sp for sp in spans if sp.text]
+        if not spans:
             continue
-        sizes = [round(s["size"], 1) for s in spans]
-        bold = any(
-            _flags_bold(s.get("flags", 0))
-            or any(tag in s.get("font", "") for tag in ("Bold", "Black", "Heavy"))
-            for s in spans
-        )
-        italic = any(
-            _flags_italic(s.get("flags", 0))
-            or any(tag in s.get("font", "") for tag in ("Italic", "Oblique"))
-            for s in spans
-        )
+        sizes = [round(s["size"], 1) for s in raw_spans]
         line_records.append({
-            "text": text,
+            "spans": spans,
             "bbox": tuple(line["bbox"]),
             "sizes": sizes,
-            "bold": bold,
-            "italic": italic,
         })
 
     if not line_records:
@@ -153,32 +184,84 @@ def _split_block(block: dict, page_index: int, indent_threshold: float) -> list[
                 page=page_index,
                 size=Counter(all_sizes).most_common(1)[0][0],
                 bbox=bbox,
-                lines=[r["text"] for r in para],
-                bold=any(r["bold"] for r in para),
-                italic=any(r["italic"] for r in para),
+                lines=[r["spans"] for r in para],
             )
         )
     return out
 
 
-def _join_lines(lines: list[str], dehyphenate: bool = False) -> str:
-    """Join lines into a single paragraph.
+def _render_paragraph(
+    lines: list[list[Span]],
+    *,
+    dehyphenate: bool = False,
+    html_mode: bool = False,
+    emit_em: bool = True,
+    emit_strong: bool = True,
+) -> str:
+    """Join a paragraph's lines into a single string.
 
-    Lines ending in a hyphen are glued to the next line without a space
-    (so 'fragrant-' + 'smelling' → 'fragrant-smelling'). If dehyphenate
-    is True, the hyphen itself is also dropped — only useful for books
-    whose typesetter breaks single words across lines.
+    Lines ending in a hyphen glue to the next line without a space
+    (preserving compound words like 'fragrant-smelling' that the typesetter
+    broke across lines). If dehyphenate is True, the hyphen is dropped at
+    line boundaries before an alpha continuation.
+
+    With html_mode=False, returns plain visible text — useful for analysis
+    (length checks, sentence-end detection). With html_mode=True, escapes
+    HTML and wraps italic/bold spans in <em>/<strong>, coalescing adjacent
+    same-tag spans so multi-line italics produce a single <em>…</em>.
     """
     if not lines:
         return ""
-    parts = [lines[0]]
-    for line in lines[1:]:
-        prev = parts[-1]
-        if prev.endswith("-") and line[:1].isalpha():
-            parts[-1] = (prev[:-1] if dehyphenate else prev) + line
+
+    # Per line-transition: decide separator (space or empty for hyphen-glue),
+    # and whether the previous line's last span should drop its trailing hyphen.
+    n = len(lines)
+    separators = [""] * n
+    drop_hyphen = [False] * n  # index of the line whose last span loses its trailing '-'
+    for i in range(1, n):
+        prev_line, cur_line = lines[i - 1], lines[i]
+        if not prev_line or not cur_line:
+            separators[i] = " "
+            continue
+        prev_last_text = prev_line[-1].text
+        cur_first_text = cur_line[0].text
+        if prev_last_text.endswith("-") and cur_first_text[:1].isalpha():
+            separators[i] = ""
+            if dehyphenate:
+                drop_hyphen[i - 1] = True
         else:
-            parts.append(line)
-    return " ".join(parts)
+            separators[i] = " "
+
+    out: list[str] = []
+    for line_idx, line in enumerate(lines):
+        if separators[line_idx]:
+            out.append(separators[line_idx])
+        for span_idx, span in enumerate(line):
+            text = span.text
+            if (
+                span_idx == len(line) - 1
+                and drop_hyphen[line_idx]
+                and text.endswith("-")
+            ):
+                text = text[:-1]
+            if not text:
+                continue
+            if html_mode:
+                text = html.escape(text, quote=False)
+                if emit_em and span.italic:
+                    text = f"<em>{text}</em>"
+                if emit_strong and span.bold:
+                    text = f"<strong>{text}</strong>"
+            out.append(text)
+
+    result = "".join(out)
+
+    if html_mode:
+        # Coalesce adjacent same-tag spans (e.g. multi-line italics).
+        result = re.sub(r"</em>(\s*)<em>", r"\1", result)
+        result = re.sub(r"</strong>(\s*)<strong>", r"\1", result)
+
+    return result
 
 
 # Sentence-terminal punctuation. A block ending in any of these (optionally
@@ -221,8 +304,6 @@ def merge_paragraph_splits(blocks: list[Block]) -> list[Block]:
         ):
             prev = out[-1]
             prev.lines = prev.lines + b.lines
-            prev.bold = prev.bold or b.bold
-            prev.italic = prev.italic or b.italic
         else:
             out.append(b)
     return out
@@ -271,6 +352,8 @@ def cmd_convert(args: argparse.Namespace) -> int:
     blocks = read_blocks(Path(args.pdf), _parse_pages(args.pages))
 
     # 1. Filter page furniture (small/large outliers) and decorative images.
+    # --drop-below/--drop-above only fire for *short* blocks (furniture-shaped)
+    # so multi-paragraph small-font content (copyright, imprint) survives.
     def keep(b: Block) -> bool:
         if b.kind == "image":
             if args.no_images:
@@ -278,9 +361,13 @@ def cmd_convert(args: argparse.Namespace) -> int:
             w = b.bbox[2] - b.bbox[0]
             h = b.bbox[3] - b.bbox[1]
             return min(w, h) >= args.min_image_size
-        if args.drop_below is not None and b.size < args.drop_below:
+        looks_like_furniture = (
+            args.max_furniture_chars == 0
+            or len(b.text()) <= args.max_furniture_chars
+        )
+        if args.drop_below is not None and b.size < args.drop_below and looks_like_furniture:
             return False
-        if args.drop_above is not None and b.size > args.drop_above:
+        if args.drop_above is not None and b.size > args.drop_above and looks_like_furniture:
             return False
         return True
 
@@ -312,8 +399,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
             prev_block = b
             continue
 
-        text = b.text(dehyphenate=args.dehyphenate)
-        if not text:
+        if not b.text():  # skip empty
             continue
         tag = size_to_tag.get(b.size, args.default_tag)
         cls: str | None = None
@@ -329,7 +415,15 @@ def cmd_convert(args: argparse.Namespace) -> int:
             )
             if after_section_marker or big_gap:
                 cls = args.break_class
-        out_parts.append(_render(tag, text, cls=cls))
+        # Headings stay clean (no <strong> — heading CSS already bolds them);
+        # body keeps both emphasis tags.
+        is_heading = tag in heading_tags
+        rendered_text = b.html(
+            dehyphenate=args.dehyphenate,
+            emit_em=not args.no_emphasis,
+            emit_strong=not args.no_emphasis and not is_heading,
+        )
+        out_parts.append(_render(tag, rendered_text, cls=cls))
         prev_tag = tag
         prev_block = b
 
@@ -340,11 +434,12 @@ def cmd_convert(args: argparse.Namespace) -> int:
     return 0
 
 
-def _render(tag: str, text: str, cls: str | None = None) -> str:
-    escaped = html.escape(text, quote=False)
+def _render(tag: str, html_text: str, cls: str | None = None) -> str:
+    """Wrap pre-escaped HTML content in an opening/closing tag pair.
+    html_text is assumed to already be HTML-safe (output of Block.html())."""
     if cls:
-        return f'<{tag} class="{html.escape(cls, quote=True)}">{escaped}</{tag}>'
-    return f"<{tag}>{escaped}</{tag}>"
+        return f'<{tag} class="{html.escape(cls, quote=True)}">{html_text}</{tag}>'
+    return f"<{tag}>{html_text}</{tag}>"
 
 
 def _render_image(wrapper_class: str) -> str:
@@ -405,8 +500,14 @@ def main(argv: list[str] | None = None) -> int:
         help="map a font size to a tag, e.g. --map 24=h1. Repeatable.",
     )
     pc.add_argument("--default-tag", default="p", help="tag for unmapped sizes (default: p)")
-    pc.add_argument("--drop-below", type=float, help="drop blocks smaller than this (filters page numbers/captions)")
+    pc.add_argument("--drop-below", type=float, help="drop blocks smaller than this (typically used to filter page numbers / running headers)")
     pc.add_argument("--drop-above", type=float, help="drop blocks larger than this")
+    pc.add_argument(
+        "--max-furniture-chars",
+        type=int,
+        default=30,
+        help="only treat blocks as furniture (eligible for --drop-below/--drop-above) if their text is this short. Default: 30. Lets multi-paragraph small-font content (copyright/imprint) survive. Pass 0 to drop unconditionally by size.",
+    )
     pc.add_argument(
         "--no-merge",
         action="store_true",
@@ -416,6 +517,11 @@ def main(argv: list[str] | None = None) -> int:
         "--dehyphenate",
         action="store_true",
         help="drop end-of-line hyphens (off by default; only useful if the typesetter breaks single words across lines)",
+    )
+    pc.add_argument(
+        "--no-emphasis",
+        action="store_true",
+        help="skip <em>/<strong> wrapping around italic/bold spans (default: include them)",
     )
     pc.add_argument(
         "--heading-class",
