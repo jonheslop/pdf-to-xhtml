@@ -427,7 +427,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
         prev_tag = tag
         prev_block = b
 
-    xhtml = _wrap_xhtml("\n    ".join(out_parts), title=args.title or Path(args.pdf).stem)
+    xhtml = _wrap_xhtml(_assemble_body(out_parts), title=args.title or Path(args.pdf).stem)
     out_path = Path(args.out)
     out_path.write_text(xhtml)
     print(f"Wrote {out_path} ({len(blocks)} blocks → {len(filtered)} kept → {len(out_parts)} elements)")
@@ -445,6 +445,24 @@ def _render(tag: str, html_text: str, cls: str | None = None) -> str:
 def _render_image(wrapper_class: str) -> str:
     cls = f' class="{html.escape(wrapper_class, quote=True)}"' if wrapper_class else ""
     return f'<p{cls}><img src="" alt=""/></p>'
+
+
+_HEADING_PREFIXES = tuple(f"<h{n}" for n in range(1, 7))
+
+
+def _assemble_body(parts: list[str]) -> str:
+    """Join rendered elements with newlines, inserting a blank line before and
+    after any heading (h1-h6) so the source is easier to scan."""
+    if not parts:
+        return ""
+    out = [parts[0]]
+    for i in range(1, len(parts)):
+        part = parts[i]
+        prev_was_heading = parts[i - 1].startswith(_HEADING_PREFIXES)
+        is_heading = part.startswith(_HEADING_PREFIXES)
+        out.append("\n\n    " if (is_heading or prev_was_heading) else "\n    ")
+        out.append(part)
+    return "".join(out)
 
 
 def _wrap_xhtml(body: str, title: str) -> str:
