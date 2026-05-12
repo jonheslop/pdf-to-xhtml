@@ -158,15 +158,23 @@ def _split_block(block: dict, page_index: int, indent_threshold: float) -> list[
     # are paragraph-start indents.
     x0_mode = Counter(round(l["bbox"][0], 1) for l in line_records).most_common(1)[0][0]
 
+    def line_size(rec):
+        return Counter(rec["sizes"]).most_common(1)[0][0]
+
     paragraphs: list[list[dict]] = []
     current: list[dict] = []
     for rec in line_records:
-        is_indent_start = current and rec["bbox"][0] > x0_mode + indent_threshold
-        if is_indent_start:
-            paragraphs.append(current)
-            current = [rec]
-        else:
-            current.append(rec)
+        if current:
+            is_indent_start = rec["bbox"][0] > x0_mode + indent_threshold
+            # A different dominant size on this line vs the previous = different
+            # typographic role (e.g., 10pt "CHAPTER 2" stacked above 24pt "DETAIL"
+            # on a chapter opener). Split into separate paragraphs.
+            is_size_change = abs(line_size(current[-1]) - line_size(rec)) > 1.0
+            if is_indent_start or is_size_change:
+                paragraphs.append(current)
+                current = [rec]
+                continue
+        current.append(rec)
     if current:
         paragraphs.append(current)
 
@@ -377,13 +385,23 @@ def cmd_convert(args: argparse.Namespace) -> int:
     if not args.no_merge:
         filtered = merge_paragraph_splits(filtered)
 
-    # 3. Build size→tag mapping.
-    size_to_tag: dict[float, str] = {}
+    # 3. Build size→(tag, class) mapping. --map SIZE=TAG or SIZE=TAG:CLASS.
+    # Class None = use the default for the tag (e.g. --heading-class for h*).
+    # Class "" = render with no class attribute.
+    size_to_tag: dict[float, tuple[str, str | None]] = {}
     if args.body is not None:
-        size_to_tag[args.body] = "p"
+        size_to_tag[args.body] = ("p", None)
     for pair in args.map or []:
-        size_str, tag = pair.split("=", 1)
-        size_to_tag[float(size_str)] = tag
+        size_str, tag_spec = pair.split("=", 1)
+        if ":" in tag_spec:
+            tag, explicit_cls = tag_spec.split(":", 1)
+        else:
+            tag, explicit_cls = tag_spec, None
+        size_to_tag[float(size_str)] = (tag, explicit_cls)
+
+    # Always-on chapter detection: matches blocks that are exactly "CHAPTER N"
+    # and emits them as <h2 class="chapter-number">CHAPTER N</h2>.
+    chapter_marker = re.compile(r"^CHAPTER\s+\S+$")
 
     # 4. Render. Track previous element so we can mark first-of-section <p>s.
     heading_tags = {"h1", "h2", "h3", "h4", "h5", "h6"}
@@ -399,11 +417,25 @@ def cmd_convert(args: argparse.Namespace) -> int:
             prev_block = b
             continue
 
-        if not b.text():  # skip empty
+        plain = b.text()
+        if not plain:
             continue
-        tag = size_to_tag.get(b.size, args.default_tag)
-        cls: str | None = None
-        if tag in themed_tags and args.heading_class:
+
+        # Always-on chapter detection: "CHAPTER N" → <h2 class="chapter-number">CHAPTER N</h2>.
+        m = chapter_marker.match(plain)
+        if m and m.end() == len(plain):
+            escaped = html.escape(m.group(0), quote=False)
+            out_parts.append(
+                f'<h2 class="{html.escape(args.chapter_number_class, quote=True)}">{escaped}</h2>'
+            )
+            prev_tag = "h2"
+            prev_block = b
+            continue
+
+        tag, explicit_cls = size_to_tag.get(b.size, (args.default_tag, None))
+        if explicit_cls is not None:
+            cls = explicit_cls or None
+        elif tag in themed_tags and args.heading_class:
             cls = args.heading_class
         elif tag == "p" and args.break_class:
             after_section_marker = prev_tag in non_continuation_tags
@@ -413,8 +445,9 @@ def cmd_convert(args: argparse.Namespace) -> int:
                 and prev_block.page == b.page
                 and (b.bbox[1] - prev_block.bbox[3]) >= args.break_gap
             )
-            if after_section_marker or big_gap:
-                cls = args.break_class
+            cls = args.break_class if (after_section_marker or big_gap) else None
+        else:
+            cls = None
         # Headings stay clean (no <strong> — heading CSS already bolds them);
         # body keeps both emphasis tags.
         is_heading = tag in heading_tags
@@ -514,8 +547,10 @@ def main(argv: list[str] | None = None) -> int:
     pc.add_argument(
         "--map",
         action="append",
-        metavar="SIZE=TAG",
-        help="map a font size to a tag, e.g. --map 24=h1. Repeatable.",
+        metavar="SIZE=TAG[:CLASS]",
+        help="map a font size to a tag, optionally with a class. Repeatable. "
+        "Examples: --map 24=h1, --map 24=h1:chapter-heading, "
+        "--map 15=h2: (explicit no-class).",
     )
     pc.add_argument("--default-tag", default="p", help="tag for unmapped sizes (default: p)")
     pc.add_argument("--drop-below", type=float, help="drop blocks smaller than this (typically used to filter page numbers / running headers)")
@@ -572,6 +607,11 @@ def main(argv: list[str] | None = None) -> int:
         "--image-class",
         default="image",
         help="class on the <p> wrapper around <img> (default: image; pass '' to disable)",
+    )
+    pc.add_argument(
+        "--chapter-number-class",
+        default="chapter-number",
+        help='class on the <h2> that wraps a detected "CHAPTER N" line (default: chapter-number)',
     )
     pc.set_defaults(func=cmd_convert)
 
