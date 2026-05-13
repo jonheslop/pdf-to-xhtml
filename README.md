@@ -1,6 +1,8 @@
 # PDF to HTML
 
-My helper script for pdf to epub conversion
+My helper script for pdf to epub conversion, prompted by me, written by Claude.
+
+It’s not perfect but it gets me 80% of the way so I can finesse the rest manually. Takes away a lot of the tedium. 
 
 Usage from anywhere:
 
